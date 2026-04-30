@@ -505,7 +505,211 @@ function kv(label, value, mono=true) {
   return `<div><div class="label">${label}</div><div class="${mono?'val':'val'}" style="${mono?'font-family:var(--mono);':''}font-size:0.85rem;">${value||'—'}</div></div>`;
 }
 
-// ─── TRACE ENGINE ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// ALGORITHM 1: SUPPLY CHAIN GRAPH — BFS CONTAMINATION PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════
+// Models the entire supply chain as a directed graph:
+//   LOT → BATCH → ORDER → CUSTOMER
+// Uses Breadth-First Search to propagate contamination forward from any
+// node, discovering ALL downstream affected entities in O(V+E) time.
+
+class SupplyChainGraph {
+  constructor() {
+    this.adjacency = {};  // node → [connected nodes]
+    this.nodeData  = {};  // node → metadata
+    this.built     = false;
+  }
+
+  addEdge(from, to) {
+    if (!this.adjacency[from]) this.adjacency[from] = [];
+    if (!this.adjacency[from].includes(to)) this.adjacency[from].push(to);
+  }
+
+  build() {
+    // Layer 1: LOT → BATCH (raw material feeds production)
+    (window.PRODUCTION||[]).forEach(p => {
+      if (p.input_lot_ref && p.batch_id) {
+        this.addEdge(`LOT:${p.input_lot_ref}`, `BATCH:${p.batch_id}`);
+        this.nodeData[`BATCH:${p.batch_id}`] = {
+          type:'batch', machine: p.machine_id, shift: p.shift,
+          operator: p.operator_id, date: p.date,
+          confidence: p.confidence||100, isInferred: p.is_inferred||false
+        };
+      }
+    });
+
+    // Layer 2: BATCH → ORDER (batch is dispatched in an order)
+    (window.DISPATCH||[]).forEach(d => {
+      (d.batch_refs||[]).forEach(batchId => {
+        this.addEdge(`BATCH:${batchId}`, `ORDER:${d.order_id}`);
+        this.nodeData[`ORDER:${d.order_id}`] = {
+          type:'order', customer: d.customer_id, date: d.dispatch_date,
+          quantity: d.quantity, product: d.product_type
+        };
+      });
+    });
+
+    // Layer 3: ORDER → CUSTOMER (order goes to OEM)
+    (window.DISPATCH||[]).forEach(d => {
+      if (d.customer_id) {
+        this.addEdge(`ORDER:${d.order_id}`, `OEM:${d.customer_id}`);
+      }
+    });
+
+    this.built = true;
+    const nodeCount = Object.keys(this.adjacency).length;
+    const edgeCount = Object.values(this.adjacency).reduce((s,e) => s + e.length, 0);
+    console.log(`[Graph] Built: ${nodeCount} nodes, ${edgeCount} edges`);
+    return { nodes: nodeCount, edges: edgeCount };
+  }
+
+  // BFS: start from contaminated node, find everything downstream
+  bfs(startNode) {
+    const visited = new Set();
+    const queue   = [startNode];
+    const result  = { batches: [], orders: [], customers: [], path: [] };
+    let depth = 0;
+
+    while (queue.length > 0) {
+      const levelSize = queue.length;
+      for (let i = 0; i < levelSize; i++) {
+        const node = queue.shift();
+        if (visited.has(node)) continue;
+        visited.add(node);
+        result.path.push({ node, depth });
+
+        const [type, id] = node.split(':');
+        if (type === 'BATCH')  result.batches.push(id);
+        if (type === 'ORDER')  result.orders.push(id);
+        if (type === 'OEM')    result.customers.push(id);
+
+        (this.adjacency[node] || []).forEach(neighbor => {
+          if (!visited.has(neighbor)) queue.push(neighbor);
+        });
+      }
+      depth++;
+    }
+
+    result.maxDepth = depth;
+    return result;
+  }
+}
+
+window.SCGraph = new SupplyChainGraph();
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALGORITHM 2: COMPOSITE RISK SCORE (CRS)
+// ═══════════════════════════════════════════════════════════════════════
+// Weighted scoring formula for each affected order:
+//
+//   CRS = (W1 × QC_Factor) + (W2 × Timing_Factor) + (W3 × Volume_Factor) + (W4 × Confidence_Penalty)
+//
+// Where:
+//   QC_Factor (0-40):  FAIL=40, PASS-but-contaminated=15, No-QC=25
+//   Timing_Factor (0-30): How long after QC FAIL was it dispatched? Worse = higher
+//   Volume_Factor (0-15): Normalized quantity (higher qty = more risk)
+//   Confidence_Penalty (0-15): If batch was imputed, lower confidence = higher risk
+//
+// Scale: 0-100. ≥70 = CRITICAL. 40-69 = HIGH. 20-39 = MEDIUM. <20 = LOW.
+
+function computeRiskScore(order, qc, prod, qcFailDate) {
+  let score = 0;
+
+  // W1: QC Factor (max 40 points)
+  if (qc) {
+    if (qc.pass_fail === 'FAIL') {
+      score += 25 + Math.min(15, (qc.defect_rate_pct || 0) * 2.5); // 25 base + up to 15 for severity
+    } else {
+      score += 15; // Passed QC but used contaminated lot — still risky
+    }
+  } else {
+    score += 25; // No QC record at all — uncertainty is risk
+  }
+
+  // W2: Timing Factor (max 30 points)
+  if (order.dispatchDate && qcFailDate) {
+    const daysDelta = (new Date(order.dispatchDate) - new Date(qcFailDate)) / 86400000;
+    if (daysDelta > 0) {
+      // Dispatched AFTER QC fail — should have been caught. Worse the longer the gap.
+      score += Math.min(30, 20 + Math.min(10, daysDelta / 10));
+    } else {
+      // Dispatched before QC fail — escaped. Score based on how close to the fail date.
+      score += Math.max(5, 15 + daysDelta / 3); // closer to fail = higher score
+    }
+  }
+
+  // W3: Volume Factor (max 15 points)
+  const qty = parseInt(order.quantity) || 0;
+  score += Math.min(15, qty / 60); // 900 units → 15 pts
+
+  // W4: Confidence Penalty (max 15 points) — imputed batches are riskier
+  if (prod && prod.isInferred) {
+    const confScore = prod.confidence || 0;
+    score += confScore === 75 ? 5 : confScore === 45 ? 10 : 15;
+  }
+
+  return {
+    score: Math.round(Math.min(100, score)),
+    grade: score >= 70 ? 'CRITICAL' : score >= 40 ? 'HIGH' : score >= 20 ? 'MEDIUM' : 'LOW',
+    color: score >= 70 ? 'var(--red)' : score >= 40 ? '#f97316' : score >= 20 ? 'var(--amber)' : 'var(--green)'
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALGORITHM 3: SUPPLIER ENTROPY ANOMALY DETECTION
+// ═══════════════════════════════════════════════════════════════════════
+// For each lot number, compute Shannon entropy of supplier distribution.
+// A normal lot comes from 1 supplier → entropy = 0.
+// LOT-2023-114 comes from 6 suppliers → entropy ≈ 2.58 (extremely high).
+//
+// Formula: H = -Σ (p_i × log2(p_i))
+// where p_i = fraction of receipts from supplier i for that lot.
+//
+// Flag lots where entropy > 1.0 (more than 2 distinct suppliers with
+// meaningful receipt volumes). These represent supply chain anomalies.
+
+function computeSupplierEntropy() {
+  const lotSupplierCounts = {};
+
+  (window.RAW_MATERIALS||[]).forEach(r => {
+    const lot = r.lot_number;
+    const sup = r.supplier_id;
+    if (!lot || !sup) return;
+    if (!lotSupplierCounts[lot]) lotSupplierCounts[lot] = {};
+    lotSupplierCounts[lot][sup] = (lotSupplierCounts[lot][sup] || 0) + 1;
+  });
+
+  const results = {};
+  for (const [lot, suppliers] of Object.entries(lotSupplierCounts)) {
+    const counts = Object.values(suppliers);
+    const total  = counts.reduce((a,b) => a+b, 0);
+    let entropy  = 0;
+    counts.forEach(c => {
+      const p = c / total;
+      if (p > 0) entropy -= p * Math.log2(p);
+    });
+
+    results[lot] = {
+      supplierCount: Object.keys(suppliers).length,
+      entropy: parseFloat(entropy.toFixed(3)),
+      isAnomaly: entropy > 1.0,
+      suppliers: suppliers,
+      severity: entropy > 2.0 ? 'CRITICAL' : entropy > 1.0 ? 'HIGH' : 'NORMAL'
+    };
+  }
+
+  // Sort by entropy descending
+  window.ENTROPY_RESULTS = Object.entries(results)
+    .sort((a,b) => b[1].entropy - a[1].entropy)
+    .reduce((obj, [k,v]) => { obj[k] = v; return obj; }, {});
+
+  const anomalies = Object.entries(results).filter(([,v]) => v.isAnomaly);
+  console.log(`[Entropy] ${anomalies.length} anomalous lots detected (entropy > 1.0)`);
+  return results;
+}
+
 function traceOrder(orderId) {
   const t0 = performance.now();
   orderId = orderId.trim().toUpperCase();
@@ -667,13 +871,26 @@ function contaminationBlast(lotNumber) {
   )];
   if (!affectedBatches.length) return {error:`Lot "${lotNumber}" not found in production records.`};
 
+  // ── ALGORITHM: BFS Graph Propagation (validates blast radius) ──
+  let graphResult = null;
+  if (window.SCGraph && window.SCGraph.built) {
+    graphResult = window.SCGraph.bfs(`LOT:${lotNumber}`);
+    console.log(`[BFS] LOT:${lotNumber} → ${graphResult.batches.length} batches, ${graphResult.orders.length} orders, ${graphResult.customers.length} OEMs (depth: ${graphResult.maxDepth})`);
+  }
+
+  // ── ALGORITHM: Supplier Entropy for this lot ──
+  const entropyData = (window.ENTROPY_RESULTS||{})[lotNumber] || null;
+
+  const QC_FAIL_DATE = "2023-03-27"; // BATCH-2023-0500 QC inspection date
+
   const affectedOrders = [];
   (window.DISPATCH||[]).forEach(order => {
     const hit = (order.batch_refs||[]).find(b => affectedBatches.includes(b));
     if (hit) {
       const prod = (window.PRODUCTION||[]).find(p => p.batch_id === hit);
       const qc   = (window.QC_MAP||{})[hit];
-      affectedOrders.push({
+
+      const orderData = {
         orderId: order.order_id, customer: order.customer_id,
         dispatchDate: order.dispatch_date, productType: order.product_type,
         quantity: order.quantity, matchedBatch: hit,
@@ -681,14 +898,20 @@ function contaminationBlast(lotNumber) {
         defectRate: qc?.defect_rate_pct, reworkFlag: qc?.rework_flag,
         riskLevel: qc?.pass_fail==='FAIL' ? 'HIGH' : 'MEDIUM',
         shift: prod?.shift, machine: prod?.machine_id,
-      });
+      };
+
+      // ── ALGORITHM: Composite Risk Score (CRS) per order ──
+      const crs = computeRiskScore(orderData, qc, prod, QC_FAIL_DATE);
+      orderData.riskScore = crs.score;
+      orderData.riskGrade = crs.grade;
+      orderData.riskColor = crs.color;
+
+      affectedOrders.push(orderData);
     }
   });
 
-  affectedOrders.sort((a,b) => {
-    if (a.riskLevel !== b.riskLevel) return a.riskLevel==='HIGH' ? -1 : 1;
-    return (a.dispatchDate||'') < (b.dispatchDate||'') ? -1 : 1;
-  });
+  // Sort by CRS score descending (highest risk first)
+  affectedOrders.sort((a,b) => (b.riskScore||0) - (a.riskScore||0));
 
   // [v2 FIX] Financial impact: C001 + C003 only. C002 is MC-03 tooling — UNRELATED
   const knownImpact = 185000 + 67500; // C001 + C003
@@ -699,8 +922,6 @@ function contaminationBlast(lotNumber) {
   const uniqueCustomers = [...new Set(affectedOrders.map(o=>o.customer))];
   const anomaly = (window.LOT_ANOMALIES||{})[lotNumber];
 
-  // [v2 FIX] Use QC FAIL date (2023-03-27) as threshold, not complaint date
-  const QC_FAIL_DATE = "2023-03-27"; // BATCH-2023-0500 QC inspection date
   const escapedOrders = affectedOrders.filter(o =>
     o.riskLevel==='HIGH' && new Date(o.dispatchDate) < new Date(QC_FAIL_DATE)
   );
@@ -714,9 +935,11 @@ function contaminationBlast(lotNumber) {
     knownImpact, totalExposure: knownImpact + estAdditional,
     complaints, anomaly, escapedOrders, knowinglyDispatched,
     unshippedBatches: affectedBatches.filter(b => !affectedOrders.some(o => o.matchedBatch === b)),
+    graphResult, entropyData,
     elapsed: (performance.now()-t0).toFixed(2)
   };
 }
+
 
 function renderBlast(result) {
   if (result.error) {
@@ -725,7 +948,8 @@ function renderBlast(result) {
     </div>`;
   }
   const {lotNumber,affectedBatches,affectedOrders,uniqueCustomers,highRiskOrders,
-    knownImpact,totalExposure,complaints,anomaly,escapedOrders,knowinglyDispatched,elapsed} = result;
+    knownImpact,totalExposure,complaints,anomaly,escapedOrders,knowinglyDispatched,
+    graphResult,entropyData,elapsed} = result;
 
   let html = `<div class="reveal reveal-1">`;
 
@@ -745,6 +969,49 @@ function renderBlast(result) {
     <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
       ${uniqueCustomers.map(c=>customerBadge(c)).join('')}
       <span style="font-family:var(--mono);font-size:0.7rem;color:var(--muted);align-self:center;">· Detected in ${elapsed}ms</span>
+    </div>
+  </div>`;
+
+  // ── ALGORITHM INTELLIGENCE PANEL ──
+  html += `<div class="tl-card" style="padding:1.25rem;margin-bottom:1rem;background:rgba(99,102,241,0.05);border-color:rgba(99,102,241,0.3);">
+    <div style="font-family:Orbitron,monospace;font-size:0.78rem;letter-spacing:0.1em;color:#818cf8;margin-bottom:0.75rem;">⚙ ALGORITHM INTELLIGENCE</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;">
+
+      <div style="background:rgba(0,0,0,0.3);padding:0.75rem;border-radius:6px;border:1px solid rgba(99,102,241,0.15);">
+        <div style="font-family:var(--mono);font-size:0.7rem;color:#818cf8;margin-bottom:0.4rem;">BFS GRAPH PROPAGATION</div>
+        <div style="font-family:var(--mono);font-size:0.72rem;color:var(--muted);line-height:1.6;">
+          ${graphResult ? `
+            Graph traversal: LOT → ${graphResult.batches.length} batches → ${graphResult.orders.length} orders → ${graphResult.customers.length} OEMs<br>
+            <span style="color:var(--text);">Propagation depth: ${graphResult.maxDepth} layers</span><br>
+            <span style="color:var(--text);">Nodes visited: ${graphResult.path.length}</span> · O(V+E) time
+          ` : 'Graph not initialized — using linear scan fallback'}
+        </div>
+      </div>
+
+      <div style="background:rgba(0,0,0,0.3);padding:0.75rem;border-radius:6px;border:1px solid rgba(99,102,241,0.15);">
+        <div style="font-family:var(--mono);font-size:0.7rem;color:#818cf8;margin-bottom:0.4rem;">SUPPLIER ENTROPY — SHANNON H(X)</div>
+        <div style="font-family:var(--mono);font-size:0.72rem;color:var(--muted);line-height:1.6;">
+          ${entropyData ? `
+            H(${lotNumber}) = <span style="color:${entropyData.entropy > 2 ? 'var(--red)' : entropyData.entropy > 1 ? 'var(--amber)' : 'var(--green)'};font-weight:600;">${entropyData.entropy} bits</span>
+            (${entropyData.supplierCount} suppliers)<br>
+            Normal lot entropy: 0.0 bits (single supplier)<br>
+            <span style="color:${entropyData.isAnomaly ? 'var(--red)' : 'var(--green)'};">${entropyData.isAnomaly ? '⚠ ANOMALY DETECTED — exceeds 1.0 threshold' : '✓ Within normal parameters'}</span>
+            ${entropyData.severity === 'CRITICAL' ? ' · <span style="color:var(--red);font-weight:600;">SEVERITY: CRITICAL</span>' : ''}
+          ` : 'Entropy analysis unavailable'}
+        </div>
+      </div>
+
+    </div>
+
+    <div style="margin-top:0.75rem;background:rgba(0,0,0,0.3);padding:0.75rem;border-radius:6px;border:1px solid rgba(99,102,241,0.15);">
+      <div style="font-family:var(--mono);font-size:0.7rem;color:#818cf8;margin-bottom:0.4rem;">COMPOSITE RISK SCORES (CRS) — PER ORDER</div>
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        ${affectedOrders.map(o => `
+          <span style="font-family:var(--mono);font-size:0.68rem;padding:3px 8px;border-radius:3px;background:${o.riskColor}15;color:${o.riskColor};border:1px solid ${o.riskColor}40;">
+            ${o.orderId}: ${o.riskScore}/100 ${o.riskGrade}
+          </span>
+        `).join('')}
+      </div>
     </div>
   </div>`;
 
@@ -1187,6 +1454,14 @@ function renderShiftStrip() {
   const loaded = await tryLoadDataJS();
   if (!loaded) loadEmbeddedDemoData();
   bridgeDataFormats();
+
+  // Build Supply Chain Graph for BFS propagation
+  if (window.SCGraph) {
+    window.SCGraph.build();
+  }
+  // Compute Supplier Entropy for anomaly detection
+  computeSupplierEntropy();
+
   updateTopStats();
   renderShiftStrip();
   // Set today's date in entry form
