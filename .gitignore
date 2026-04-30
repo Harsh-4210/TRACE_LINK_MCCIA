@@ -1,0 +1,28 @@
+# ── Generated data (regenerate with: python clean_data.py) ──
+data.js
+
+# ── System / IDE ──
+.DS_Store
+Thumbs.db
+*.exe
+*.msi
+*.swp
+*~
+.vscode/
+.idea/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# ── Node (if ever used) ──
+node_modules/
+
+# ── Internal docs (not for submission) ──
+council-report-tracelink.html
+walkthrough.md
+pitch_playbook.md
+TRACELINK_BLUEPRINT.md

@@ -1,0 +1,4 @@
+complaint_id,oem_id,complaint_date,affected_order_ids,defect_description,root_cause_identified,resolution,financial_impact_inr
+C001,OEM-TATA,2024-03-15,"D-1847,D-1921",Surface delamination on brake pads – 340 units rejected at incoming QC,LOT-2023-114 adhesive batch – bonding agent from S03 below spec,Full recall initiated; replacement dispatched by 2024-03-24,185000
+C002,OEM-MAHINDRA,2023-08-10,D-1044,Edge burrs on backing plate – 88 units,Machine MC-03 tooling wear – Shift B operator OP-014,Rework completed; MC-03 tooling replaced,42000
+C003,OEM-BAJAJ,2024-01-22,D-1367,Dimensional deviation on clutch assembly – 55 units out of tolerance,LOT-2023-114 downstream – friction modifier quantity variance,Full replacement; process SOP updated for friction modifier measurement,67500

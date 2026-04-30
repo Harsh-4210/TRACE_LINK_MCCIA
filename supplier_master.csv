@@ -1,0 +1,7 @@
+supplier_id,supplier_name,material_supplied,lead_time_days,approved_status
+S01,Tata Metaliks Ltd,Brake lining compound,7,Approved
+S02,Minda Industries,Backing plate steel,5,Approved
+S03,Sundaram Clayton,Adhesive bonding agent,10,Approved
+S04,JK Rubber Pvt Ltd,Friction modifier,14,Approved
+S05,Bharat Forge Components,Rivet hardware,3,Approved
+S06,Chemline India Pvt Ltd,Surface treatment chemical,8,Conditional
